@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::pii::{Finding, FindingAction, PiiType};
+use crate::pii::{Finding, FindingAction};
 
 /// Hosts that commonly break under local MITM (cert pinning / browser suites).
 pub const DEFAULT_BYPASS_HOSTS: &[&str] = &[
