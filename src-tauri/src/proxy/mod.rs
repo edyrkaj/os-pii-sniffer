@@ -11,7 +11,7 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 pub use ca::{CaPaths, ensure_ca};
 
-use crate::model::ActivityDraft;
+use crate::model::SnifferEvent;
 use crate::pii::Rules;
 
 use ca::{crypto_provider, load_authority};
@@ -25,7 +25,7 @@ pub struct RunningProxy {
 pub async fn start_proxy(
     rules: Arc<RwLock<Rules>>,
     bypass: Arc<RwLock<HashSet<String>>>,
-    events: mpsc::UnboundedSender<ActivityDraft>,
+    events: mpsc::UnboundedSender<SnifferEvent>,
     ca_dir: &Path,
 ) -> Result<RunningProxy, String> {
     let listener = bind_listener().await?;
@@ -165,10 +165,15 @@ mod tests {
         if forwarded != payload {
             return Err(format!("upload was modified: {forwarded}"));
         }
-        let event = rx
-            .recv()
-            .await
-            .ok_or_else(|| "no activity event".to_string())?;
+        let event = loop {
+            let notice = rx
+                .recv()
+                .await
+                .ok_or_else(|| "no activity event".to_string())?;
+            if let crate::model::SnifferEvent::Activity(event) = notice {
+                break event;
+            }
+        };
         if event.action != "detected" || !event.alert {
             return Err(format!("expected a detection alert, got {}", event.action));
         }
