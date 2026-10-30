@@ -1,10 +1,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request};
 use http_body_util::BodyExt;
-use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse, decode_request};
+use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::model::{ActivityDraft, FindingView};
@@ -38,47 +37,27 @@ impl HttpHandler for SnifferHandler {
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let encoded = req.headers().get(http::header::CONTENT_ENCODING).is_some();
-        let req = if encoded {
-            match decode_request(req) {
-                Ok(req) => req,
-                Err(_) => return bad_gateway(),
-            }
-        } else {
-            req
+        let (parts, body) = req.into_parts();
+        let Ok(collected) = body.collect().await else {
+            return Request::from_parts(parts, Body::empty()).into();
         };
-
-        let (mut parts, body) = req.into_parts();
-        let bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => return bad_gateway(),
-        };
+        let bytes = collected.to_bytes();
         if bytes.len() > MAX_BODY {
             self.emit(ctx, skipped(&method, &host, &path));
-            parts.headers.insert(
-                http::header::CONTENT_LENGTH,
-                HeaderValue::from_str(&bytes.len().to_string())
-                    .unwrap_or(HeaderValue::from_static("0")),
-            );
-            return Request::from_parts(parts, Body::from(bytes)).into();
+            return forward_original(parts, bytes);
         }
 
         let rules = self.rules.read().await.clone();
-        let rewritten = rewrite_body(content_type.as_deref(), bytes.to_vec(), &rules);
-        if let Some(reason) = rewritten.skipped.clone() {
+        let scanned = rewrite_body(content_type.as_deref(), bytes.to_vec(), &rules);
+        if let Some(reason) = scanned.skipped.clone() {
             let mut record = skipped(&method, &host, &path);
             record.detail = Some(reason);
             self.emit(ctx, record);
-        } else if !rewritten.findings.is_empty() {
-            let action = if rewritten
+        } else if !scanned.findings.is_empty() {
+            let detected = scanned
                 .findings
                 .iter()
-                .any(|finding| finding.action == FindingAction::Masked)
-            {
-                "masked"
-            } else {
-                "allowed"
-            };
+                .any(|finding| finding.action != FindingAction::Allowed);
             self.emit(
                 ctx,
                 ActivityDraft {
@@ -86,25 +65,26 @@ impl HttpHandler for SnifferHandler {
                     method: method.to_string(),
                     host,
                     path,
-                    action: action.to_string(),
-                    alert: rewritten.alert,
+                    action: if detected { "detected" } else { "allowed" }.to_string(),
+                    alert: scanned.alert,
                     detail: None,
-                    findings: rewritten
+                    findings: scanned
                         .findings
                         .iter()
-                        .map(FindingView::from_finding)
+                        .map(|finding| {
+                            let mut view = FindingView::from_finding(finding);
+                            if finding.action != FindingAction::Allowed {
+                                view.action = "detected".to_string();
+                                view.token = "sent unchanged".to_string();
+                            }
+                            view
+                        })
                         .collect(),
                 },
             );
         }
 
-        let length = rewritten.body.len();
-        parts.headers.insert(
-            http::header::CONTENT_LENGTH,
-            HeaderValue::from_str(&length.to_string()).unwrap_or(HeaderValue::from_static("0")),
-        );
-        parts.headers.remove(http::header::TRANSFER_ENCODING);
-        Request::from_parts(parts, Body::from(rewritten.body)).into()
+        forward_original(parts, bytes)
     }
 
     async fn should_intercept_connect(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
@@ -120,8 +100,14 @@ impl SnifferHandler {
     }
 
     fn emit(&self, ctx: &HttpContext, mut draft: ActivityDraft) {
-        draft.process_name = process_name(ctx.client_addr);
-        let _ = self.events.send(draft);
+        let address = ctx.client_addr;
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            draft.process_name = tokio::task::spawn_blocking(move || process_name(address))
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
+            let _ = events.send(draft);
+        });
     }
 }
 
@@ -173,6 +159,18 @@ fn request_target(req: &Request<Body>) -> (String, String) {
     (host, path)
 }
 
+fn forward_original(
+    mut parts: http::request::Parts,
+    bytes: bytes::Bytes,
+) -> RequestOrResponse {
+    parts.headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).unwrap_or(HeaderValue::from_static("0")),
+    );
+    parts.headers.remove(http::header::TRANSFER_ENCODING);
+    Request::from_parts(parts, Body::from(bytes)).into()
+}
+
 fn connect_host(req: &Request<Body>) -> String {
     if let Some(host) = req.uri().host() {
         return host.to_ascii_lowercase();
@@ -183,14 +181,4 @@ fn connect_host(req: &Request<Body>) -> String {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase()
-}
-
-fn bad_gateway() -> RequestOrResponse {
-    Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(Body::from(Bytes::from_static(
-            b"PII Sniffer could not read the upload.",
-        )))
-        .expect("gateway response")
-        .into()
 }

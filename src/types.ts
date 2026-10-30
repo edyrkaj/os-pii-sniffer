@@ -10,7 +10,7 @@ export type Rules = Record<PiiType, TypeRule>;
 export type Finding = {
   piiType: PiiType;
   fieldPath: string;
-  action: "masked" | "allowed";
+  action: "detected" | "allowed";
   token: string;
 };
 
@@ -21,7 +21,7 @@ export type ActivityEvent = {
   method: string;
   host: string;
   path: string;
-  action: "masked" | "allowed" | "skipped";
+  action: "detected" | "allowed" | "skipped";
   alert: boolean;
   seen: boolean;
   detail: string | null;
@@ -44,27 +44,27 @@ export const PII_TYPES: { id: PiiType; label: string; hint: string }[] = [
   {
     id: "email",
     label: "Email",
-    hint: "Cleartext addresses are replaced with [redacted-email].",
+    hint: "Cleartext addresses are reported. The upload is sent unchanged.",
   },
   {
     id: "phone",
     label: "Phone",
-    hint: "Plausible phone numbers are replaced with [redacted-phone].",
+    hint: "Plausible phone numbers are reported. The upload is sent unchanged.",
   },
   {
     id: "card",
     label: "Credit card",
-    hint: "Luhn-valid card numbers are replaced with [redacted-card].",
+    hint: "Luhn-valid card numbers are reported. The upload is sent unchanged.",
   },
   {
     id: "address",
     label: "Address",
-    hint: "Street addresses are experimental and use [redacted-address].",
+    hint: "Street addresses are experimental and are only reported.",
   },
   {
     id: "contact",
     label: "Contact",
-    hint: "vCards and name-plus-email objects use [redacted-contact].",
+    hint: "vCards and name-plus-email objects are reported, not rewritten.",
   },
 ];
 
@@ -92,7 +92,7 @@ export function previewSnapshot(): Snapshot {
         method: "POST",
         host: "api.example.com",
         path: "/customers",
-        action: "masked",
+        action: "detected",
         alert: true,
         seen: false,
         detail: null,
@@ -100,8 +100,8 @@ export function previewSnapshot(): Snapshot {
           {
             piiType: "email",
             fieldPath: "$.email",
-            action: "masked",
-            token: "[redacted-email]",
+            action: "detected",
+            token: "sent unchanged",
           },
         ],
       },

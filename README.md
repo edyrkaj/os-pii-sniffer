@@ -1,5 +1,3 @@
 # PII Sniffer
 
-Local macOS guard for outbound uploads. Turn protection on to trust a local certificate, point the system HTTP(S) proxy at the app, and mask cleartext email, phone, card, address, and contact values before they are forwarded.
-
-The activity list stores redaction tokens only. It does not keep the original personal data.
+Local macOS guard for outbound uploads. Turn protection on to trust a local certificate and point the system HTTP(S) proxy at the app. Uploads are forwarded unchanged. Cleartext email, phone, card, address, and contact values are recorded in the activity list without storing the original value.

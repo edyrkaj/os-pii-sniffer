@@ -86,8 +86,9 @@ function App() {
           <p className="eyebrow">Local GDPR guard</p>
           <h1>PII Sniffer</h1>
           <p className="lede">
-            Outbound uploads that use the system proxy are scanned on this Mac. Cleartext
-            personal data is replaced before it is forwarded. The original value is not stored.
+            Outbound uploads that use the system proxy are scanned on this Mac. Requests are
+            forwarded unchanged. Cleartext personal data is recorded here and is not stored in
+            full.
           </p>
         </div>
         <section className="protection" aria-label="Protection">
@@ -256,9 +257,9 @@ function App() {
       ) : (
         <section className="rules">
           <p className="rule-note">
-            Mask replaces cleartext before the upload continues. Alert beeps and highlights the
-            row. Values that are already masked, or that are field ciphertext, are forwarded
-            unchanged.
+            Watch records a row when that kind of data is sent. Alert also beeps and highlights
+            it. Nothing is blocked or rewritten. Already-masked values and field ciphertext are
+            noted and sent as they are.
           </p>
           {PII_TYPES.map((type) => {
             const rule = snap.rules[type.id];
@@ -274,7 +275,7 @@ function App() {
                     checked={rule.mask}
                     onChange={(event) => updateRule(snap, type.id, event.target.checked, rule.alert)}
                   />
-                  Mask
+                  Watch
                 </label>
                 <label className="switch">
                   <input
