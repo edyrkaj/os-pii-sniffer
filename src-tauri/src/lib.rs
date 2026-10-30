@@ -12,7 +12,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
-use crate::model::{ActivityDraft, ActivityEvent, normalize_host};
+use crate::model::{ActivityEvent, ServiceEvent, SnifferEvent, normalize_bypass};
 use crate::pii::{PiiType, Rules, TypeRule};
 
 struct ProxyControl {
@@ -24,7 +24,7 @@ pub struct AppState {
     db: Mutex<rusqlite::Connection>,
     rules: Arc<RwLock<Rules>>,
     bypass: Arc<RwLock<HashSet<String>>>,
-    events_tx: mpsc::UnboundedSender<ActivityDraft>,
+    events_tx: mpsc::UnboundedSender<SnifferEvent>,
     proxy: Mutex<Option<ProxyControl>>,
     data_dir: PathBuf,
     notice: Mutex<Option<String>>,
@@ -45,6 +45,7 @@ struct Snapshot {
     rules: Rules,
     bypass_hosts: Vec<String>,
     events: Vec<ActivityEvent>,
+    services: Vec<ServiceEvent>,
 }
 
 #[tauri::command]
@@ -81,24 +82,27 @@ async fn set_rule(
 
 #[tauri::command]
 async fn add_bypass(state: State<'_, AppState>, host: String) -> Result<Snapshot, String> {
-    let host = normalize_host(&host)
-        .ok_or_else(|| "Enter an exact host, such as api.example.com.".to_string())?;
+    let host = normalize_bypass(&host).ok_or_else(|| {
+        "Enter an exact host or wildcard, such as api.example.com or *.google.com.".to_string()
+    })?;
     {
         let db = lock_db(&state);
         store::add_bypass(&db, &host)?;
     }
     state.bypass.write().await.insert(host);
+    refresh_os_bypass(&state)?;
     Ok(build_snapshot(&state))
 }
 
 #[tauri::command]
 async fn remove_bypass(state: State<'_, AppState>, host: String) -> Result<Snapshot, String> {
-    let host = normalize_host(&host).unwrap_or(host);
+    let host = normalize_bypass(&host).unwrap_or(host);
     {
         let db = lock_db(&state);
         store::remove_bypass(&db, &host)?;
     }
     state.bypass.write().await.remove(&host);
+    refresh_os_bypass(&state)?;
     Ok(build_snapshot(&state))
 }
 
@@ -182,17 +186,19 @@ fn enable(app: &AppHandle) -> impl std::future::Future<Output = Result<(), Strin
         )
         .await?;
         let port = running.port;
-        let saved =
-            match tauri::async_runtime::spawn_blocking(move || platform::install_proxy(port))
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(saved) => saved,
-                Err(error) => {
-                    let _ = running.shutdown.send(());
-                    return Err(error);
-                }
-            };
+        let app_bypass: Vec<String> = state.bypass.read().await.iter().cloned().collect();
+        let saved = match tauri::async_runtime::spawn_blocking(move || {
+            platform::install_proxy(port, &app_bypass)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                let _ = running.shutdown.send(());
+                return Err(error);
+            }
+        };
         {
             let db = lock_db(&state);
             store::save_session(&db, &Some(saved))?;
@@ -227,9 +233,10 @@ fn disable(app: &AppHandle) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take()
-        && let Some(shutdown) = control.shutdown.take()
     {
-        let _ = shutdown.send(());
+        if let Some(shutdown) = control.shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
     let saved = {
         let db = lock_db(&state);
@@ -270,11 +277,34 @@ fn disable(app: &AppHandle) {
     }
 }
 
+fn refresh_os_bypass(state: &AppState) -> Result<(), String> {
+    let installed = *state
+        .proxy_installed
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !installed {
+        return Ok(());
+    }
+    let saved = {
+        let db = lock_db(state);
+        store::load_session(&db)?
+    };
+    let Some(saved) = saved else {
+        return Ok(());
+    };
+    let app_bypass = {
+        let db = lock_db(state);
+        store::load_bypass(&db)?
+    };
+    platform::refresh_bypass_domains(&saved, &app_bypass)
+}
+
 fn build_snapshot(state: &AppState) -> Snapshot {
     let db = lock_db(state);
     let rules = store::load_rules(&db).unwrap_or_default();
     let bypass_hosts = store::load_bypass(&db).unwrap_or_default();
     let events = store::list_events(&db).unwrap_or_default();
+    let services = store::list_services(&db).unwrap_or_default();
     drop(db);
     let protection_on = state
         .proxy
@@ -310,6 +340,7 @@ fn build_snapshot(state: &AppState) -> Snapshot {
         rules,
         bypass_hosts,
         events,
+        services,
     }
 }
 
@@ -358,12 +389,12 @@ fn recover_stale_proxy(state: &AppState) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::unbounded_channel::<SnifferEvent>();
     tauri::Builder::default()
         .manage(events_tx)
         .setup(move |app| {
             let events_tx = app
-                .state::<mpsc::UnboundedSender<ActivityDraft>>()
+                .state::<mpsc::UnboundedSender<SnifferEvent>>()
                 .inner()
                 .clone();
             let dir = app.path().app_data_dir()?;
@@ -389,19 +420,44 @@ pub fn run() {
             recover_stale_proxy(&state);
             app.manage(state);
             let handle = app.handle().clone();
-            let mut events_rx: mpsc::UnboundedReceiver<ActivityDraft> = events_rx;
+            let mut events_rx: mpsc::UnboundedReceiver<SnifferEvent> = events_rx;
             tauri::async_runtime::spawn(async move {
-                while let Some(draft) = events_rx.recv().await {
-                    if draft.alert {
-                        platform::beep();
-                    }
-                    let inserted = {
-                        let state = handle.state::<AppState>();
-                        let db = lock_db(&state);
-                        store::insert_event(&db, &draft)
-                    };
-                    if let Ok(event) = inserted {
-                        let _ = handle.emit("activity", &event);
+                while let Some(notice) = events_rx.recv().await {
+                    match notice {
+                        SnifferEvent::Activity(draft) => {
+                            if draft.alert {
+                                platform::beep();
+                            }
+                            let inserted = {
+                                let state = handle.state::<AppState>();
+                                let db = lock_db(&state);
+                                store::insert_event(&db, &draft)
+                            };
+                            if let Ok(event) = inserted {
+                                let _ = handle.emit("activity", &event);
+                                let services = {
+                                    let state = handle.state::<AppState>();
+                                    let db = lock_db(&state);
+                                    store::list_services(&db).unwrap_or_default()
+                                };
+                                let _ = handle.emit("services", &services);
+                            }
+                        }
+                        SnifferEvent::Service(sighting) => {
+                            let updated = {
+                                let state = handle.state::<AppState>();
+                                let db = lock_db(&state);
+                                store::touch_service(&db, &sighting)
+                            };
+                            if updated.is_ok() {
+                                let services = {
+                                    let state = handle.state::<AppState>();
+                                    let db = lock_db(&state);
+                                    store::list_services(&db).unwrap_or_default()
+                                };
+                                let _ = handle.emit("services", &services);
+                            }
+                        }
                     }
                 }
             });
@@ -420,9 +476,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building PII Sniffer")
         .run(|app, event| {
-            if let tauri::RunEvent::Exit = event
-                && app.try_state::<AppState>().is_some()
-            {
+            if matches!(event, tauri::RunEvent::Exit) && app.try_state::<AppState>().is_some() {
                 disable(app);
             }
         });

@@ -4,10 +4,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
-use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse, decode_request};
+use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse};
 use tokio::sync::{RwLock, mpsc};
 
-use crate::model::{ActivityDraft, FindingView};
+use crate::model::{
+    ActivityDraft, FindingView, ServiceSighting, SnifferEvent, host_is_bypassed,
+};
 use crate::pii::{FindingAction, MAX_BODY, Rules, rewrite_body};
 use crate::platform::process_name;
 
@@ -15,7 +17,7 @@ use crate::platform::process_name;
 pub struct SnifferHandler {
     pub rules: Arc<RwLock<Rules>>,
     pub bypass: Arc<RwLock<HashSet<String>>>,
-    pub events: mpsc::UnboundedSender<ActivityDraft>,
+    pub events: mpsc::UnboundedSender<SnifferEvent>,
 }
 
 impl HttpHandler for SnifferHandler {
@@ -29,7 +31,7 @@ impl HttpHandler for SnifferHandler {
             return req.into();
         }
         if content_length(&req).is_some_and(|length| length > MAX_BODY) {
-            self.emit(ctx, skipped(&method, &host, &path));
+            self.emit_activity(ctx, skipped(&method, &host, &path, "not scanned: too large"));
             return req.into();
         }
 
@@ -39,22 +41,38 @@ impl HttpHandler for SnifferHandler {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let encoded = req.headers().get(http::header::CONTENT_ENCODING).is_some();
-        let req = if encoded {
-            match decode_request(req) {
-                Ok(req) => req,
-                Err(_) => return bad_gateway(),
-            }
-        } else {
-            req
-        };
+        // Fail open: compressed bodies are forwarded untouched so browsers keep working.
+        if encoded {
+            self.emit_activity(
+                ctx,
+                skipped(
+                    &method,
+                    &host,
+                    &path,
+                    "not scanned: compressed body forwarded unchanged",
+                ),
+            );
+            return req.into();
+        }
 
         let (mut parts, body) = req.into_parts();
         let bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
-            Err(_) => return bad_gateway(),
+            Err(_) => {
+                self.emit_activity(
+                    ctx,
+                    skipped(
+                        &method,
+                        &host,
+                        &path,
+                        "not scanned: body read failed; request dropped",
+                    ),
+                );
+                return bad_gateway();
+            }
         };
         if bytes.len() > MAX_BODY {
-            self.emit(ctx, skipped(&method, &host, &path));
+            self.emit_activity(ctx, skipped(&method, &host, &path, "not scanned: too large"));
             parts.headers.insert(
                 http::header::CONTENT_LENGTH,
                 HeaderValue::from_str(&bytes.len().to_string())
@@ -66,10 +84,24 @@ impl HttpHandler for SnifferHandler {
         let rules = self.rules.read().await.clone();
         let rewritten = rewrite_body(content_type.as_deref(), bytes.to_vec(), &rules);
         if let Some(reason) = rewritten.skipped.clone() {
-            let mut record = skipped(&method, &host, &path);
+            let mut record = skipped(&method, &host, &path, &reason);
             record.detail = Some(reason);
-            self.emit(ctx, record);
-        } else if !rewritten.findings.is_empty() {
+            self.emit_activity(ctx, record);
+        } else if rewritten.findings.is_empty() {
+            self.emit_activity(
+                ctx,
+                ActivityDraft {
+                    process_name: String::new(),
+                    method: method.to_string(),
+                    host: host.clone(),
+                    path: path.clone(),
+                    action: "clean".to_string(),
+                    alert: false,
+                    detail: Some("scanned: no cleartext PII".to_string()),
+                    findings: Vec::new(),
+                },
+            );
+        } else {
             let action = if rewritten
                 .findings
                 .iter()
@@ -79,13 +111,13 @@ impl HttpHandler for SnifferHandler {
             } else {
                 "allowed"
             };
-            self.emit(
+            self.emit_activity(
                 ctx,
                 ActivityDraft {
                     process_name: String::new(),
                     method: method.to_string(),
-                    host,
-                    path,
+                    host: host.clone(),
+                    path: path.clone(),
                     action: action.to_string(),
                     alert: rewritten.alert,
                     detail: None,
@@ -107,25 +139,42 @@ impl HttpHandler for SnifferHandler {
         Request::from_parts(parts, Body::from(rewritten.body)).into()
     }
 
-    async fn should_intercept_connect(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
+    async fn should_intercept_connect(&mut self, ctx: &HttpContext, req: &Request<Body>) -> bool {
         let host = connect_host(req);
-        !self.is_bypass(&host).await
+        let bypass = self.is_bypass(&host).await;
+        let mode = if bypass { "tunneled" } else { "inspected" };
+        self.emit_service(
+            ctx,
+            ServiceSighting {
+                process_name: String::new(),
+                host,
+                mode: mode.to_string(),
+                scanned: false,
+                pii: false,
+            },
+        );
+        !bypass
     }
 }
 
 impl SnifferHandler {
     async fn is_bypass(&self, host: &str) -> bool {
         let hosts = self.bypass.read().await;
-        hosts.contains(&host.to_ascii_lowercase())
+        host_is_bypassed(host, &hosts)
     }
 
-    fn emit(&self, ctx: &HttpContext, mut draft: ActivityDraft) {
+    fn emit_activity(&self, ctx: &HttpContext, mut draft: ActivityDraft) {
         draft.process_name = process_name(ctx.client_addr);
-        let _ = self.events.send(draft);
+        let _ = self.events.send(SnifferEvent::Activity(draft));
+    }
+
+    fn emit_service(&self, ctx: &HttpContext, mut sighting: ServiceSighting) {
+        sighting.process_name = process_name(ctx.client_addr);
+        let _ = self.events.send(SnifferEvent::Service(sighting));
     }
 }
 
-fn skipped(method: &Method, host: &str, path: &str) -> ActivityDraft {
+fn skipped(method: &Method, host: &str, path: &str, detail: &str) -> ActivityDraft {
     ActivityDraft {
         process_name: String::new(),
         method: method.to_string(),
@@ -133,7 +182,7 @@ fn skipped(method: &Method, host: &str, path: &str) -> ActivityDraft {
         path: path.to_string(),
         action: "skipped".to_string(),
         alert: false,
-        detail: Some("not scanned: too large".to_string()),
+        detail: Some(detail.to_string()),
         findings: Vec::new(),
     }
 }

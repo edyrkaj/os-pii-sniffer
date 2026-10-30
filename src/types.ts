@@ -21,11 +21,22 @@ export type ActivityEvent = {
   method: string;
   host: string;
   path: string;
-  action: "masked" | "allowed" | "skipped";
+  action: "masked" | "allowed" | "skipped" | "clean";
   alert: boolean;
   seen: boolean;
   detail: string | null;
   findings: Finding[];
+};
+
+export type ServiceEvent = {
+  host: string;
+  processName: string;
+  firstSeen: string;
+  lastSeen: string;
+  connectCount: number;
+  scannedCount: number;
+  piiCount: number;
+  lastMode: string;
 };
 
 export type Snapshot = {
@@ -38,6 +49,7 @@ export type Snapshot = {
   rules: Rules;
   bypassHosts: string[];
   events: ActivityEvent[];
+  services: ServiceEvent[];
 };
 
 export const PII_TYPES: { id: PiiType; label: string; hint: string }[] = [
@@ -83,7 +95,29 @@ export function previewSnapshot(): Snapshot {
       address: { mask: true, alert: false },
       contact: { mask: true, alert: true },
     },
-    bypassHosts: ["bank.example"],
+    bypassHosts: ["*.google.com", "bank.example"],
+    services: [
+      {
+        host: "api.example.com",
+        processName: "curl",
+        firstSeen: "2026-10-30T15:01:00Z",
+        lastSeen: "2026-10-30T15:04:00Z",
+        connectCount: 2,
+        scannedCount: 1,
+        piiCount: 1,
+        lastMode: "inspected",
+      },
+      {
+        host: "cdn.example.com",
+        processName: "Safari",
+        firstSeen: "2026-10-30T15:00:00Z",
+        lastSeen: "2026-10-30T15:03:00Z",
+        connectCount: 8,
+        scannedCount: 0,
+        piiCount: 0,
+        lastMode: "tunneled",
+      },
+    ],
     events: [
       {
         id: "preview-alert",
@@ -104,6 +138,19 @@ export function previewSnapshot(): Snapshot {
             token: "[redacted-email]",
           },
         ],
+      },
+      {
+        id: "preview-clean",
+        timestamp: "2026-10-30T15:03:00Z",
+        processName: "curl",
+        method: "POST",
+        host: "api.example.com",
+        path: "/health",
+        action: "clean",
+        alert: false,
+        seen: true,
+        detail: "scanned: no cleartext PII",
+        findings: [],
       },
       {
         id: "preview-allowed",

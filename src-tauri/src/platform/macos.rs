@@ -115,17 +115,27 @@ pub fn active_service() -> Result<String, String> {
         .ok_or_else(|| "No active network service found.".to_string())
 }
 
-pub fn install_proxy(port: u16) -> Result<SavedProxy, String> {
+pub fn install_proxy(port: u16, app_bypass: &[String]) -> Result<SavedProxy, String> {
     let service = active_service()?;
     let saved = read_saved(&service)?;
-    if let Err(error) = apply_proxy(&service, port, &saved) {
+    if let Err(error) = apply_proxy(&service, port, &saved, app_bypass) {
         let _ = restore_proxy(&saved);
         return Err(error);
     }
     Ok(saved)
 }
 
-fn apply_proxy(service: &str, port: u16, saved: &SavedProxy) -> Result<(), String> {
+/// Refresh OS proxy bypass domains while protection is already on.
+pub fn refresh_bypass_domains(saved: &SavedProxy, app_bypass: &[String]) -> Result<(), String> {
+    apply_bypass_domains(&saved.service, &saved.bypass, app_bypass)
+}
+
+fn apply_proxy(
+    service: &str,
+    port: u16,
+    saved: &SavedProxy,
+    app_bypass: &[String],
+) -> Result<(), String> {
     let port_text = port.to_string();
     run_command(
         "networksetup",
@@ -137,10 +147,24 @@ fn apply_proxy(service: &str, port: u16, saved: &SavedProxy) -> Result<(), Strin
     )?;
     run_command("networksetup", &["-setwebproxystate", service, "on"])?;
     run_command("networksetup", &["-setsecurewebproxystate", service, "on"])?;
-    let mut bypass = saved.bypass.clone();
+    apply_bypass_domains(service, &saved.bypass, app_bypass)?;
+    Ok(())
+}
+
+fn apply_bypass_domains(
+    service: &str,
+    original: &[String],
+    app_bypass: &[String],
+) -> Result<(), String> {
+    let mut bypass = original.to_vec();
     for domain in ["localhost", "127.0.0.1", "*.local"] {
         if !bypass.iter().any(|item| item == domain) {
             bypass.push(domain.to_string());
+        }
+    }
+    for domain in app_bypass {
+        if !bypass.iter().any(|item| item == domain) {
+            bypass.push(domain.clone());
         }
     }
     let mut args = vec!["-setproxybypassdomains".to_string(), service.to_string()];
@@ -250,10 +274,10 @@ pub fn parse_hardware_ports(text: &str) -> Vec<(String, String)> {
     for line in text.lines() {
         if let Some(name) = line.strip_prefix("Hardware Port:") {
             current = Some(name.trim().to_string());
-        } else if let Some(device) = line.strip_prefix("Device:")
-            && let Some(name) = current.take()
-        {
-            pairs.push((name, device.trim().to_string()));
+        } else if let Some(device) = line.strip_prefix("Device:") {
+            if let Some(name) = current.take() {
+                pairs.push((name, device.trim().to_string()));
+            }
         }
     }
     pairs
