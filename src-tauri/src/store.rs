@@ -219,10 +219,10 @@ pub fn insert_event(
         )
         .map_err(|error| error.to_string())?;
     let pii = !draft.findings.is_empty()
-        && matches!(draft.action.as_str(), "masked" | "allowed");
+        && matches!(draft.action.as_str(), "detected" | "allowed");
     let scanned = matches!(
         draft.action.as_str(),
-        "masked" | "allowed" | "clean" | "skipped"
+        "detected" | "allowed" | "clean" | "skipped"
     );
     touch_service(
         connection,
@@ -438,14 +438,14 @@ mod tests {
                 method: "POST".into(),
                 host: "api.example.com".into(),
                 path: "/upload".into(),
-                action: "masked".into(),
+                action: "detected".into(),
                 alert: true,
                 detail: None,
                 findings: vec![FindingView {
                     pii_type: "email".into(),
                     field_path: "$.email".into(),
-                    action: "masked".into(),
-                    token: "[redacted-email]".into(),
+                    action: "detected".into(),
+                    token: "sent unchanged".into(),
                 }],
             },
         )

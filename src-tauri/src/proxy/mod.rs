@@ -87,7 +87,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn masks_email_before_the_upload_is_forwarded() {
+    async fn forwards_the_upload_unchanged_and_records_pii() {
         let result = tokio::time::timeout(Duration::from_secs(20), mask_email()).await;
         result.expect("proxy test timed out").expect("proxy test");
     }
@@ -162,8 +162,8 @@ mod tests {
             .clone()
             .ok_or_else(|| "upstream received no body".to_string())?;
         let forwarded = String::from_utf8(forwarded).map_err(|error| error.to_string())?;
-        if !forwarded.contains("[redacted-email]") || forwarded.contains("ada@example.com") {
-            return Err(format!("upload was not masked: {forwarded}"));
+        if forwarded != payload {
+            return Err(format!("upload was modified: {forwarded}"));
         }
         let event = loop {
             let notice = rx
@@ -174,12 +174,11 @@ mod tests {
                 break event;
             }
         };
-        if event.action != "masked" || !event.alert {
-            return Err(format!("expected a masked alert, got {}", event.action));
+        if event.action != "detected" || !event.alert {
+            return Err(format!("expected a detection alert, got {}", event.action));
         }
-        if event.findings.first().map(|finding| finding.token.as_str()) != Some("[redacted-email]")
-        {
-            return Err("activity event did not record the redaction token".to_string());
+        if event.findings.first().map(|finding| finding.pii_type.as_str()) != Some("email") {
+            return Err("activity event did not record the email finding".to_string());
         }
         let _ = running.shutdown.send(());
         let _ = std::fs::remove_dir_all(dir);

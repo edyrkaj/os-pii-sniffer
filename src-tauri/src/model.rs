@@ -44,15 +44,15 @@ impl FindingView {
             pii_type: finding.pii_type.as_str().to_string(),
             field_path: finding.field_path.clone(),
             action: match finding.action {
-                FindingAction::Masked => "masked",
+                FindingAction::Masked | FindingAction::AlertedOnly => "detected",
                 FindingAction::Allowed => "allowed",
-                FindingAction::AlertedOnly => "allowed",
             }
             .to_string(),
             token: match finding.action {
-                FindingAction::Masked => PiiType::token(finding.pii_type).to_string(),
+                FindingAction::Masked | FindingAction::AlertedOnly => {
+                    "sent unchanged".to_string()
+                }
                 FindingAction::Allowed => "already-masked".to_string(),
-                FindingAction::AlertedOnly => "not-masked".to_string(),
             },
         }
     }
